@@ -6,20 +6,32 @@ using UnityEngine;
 
 namespace Boids
 {
-    public class BoidObstacleAuthoringBaker : Baker<BoidObstacleAuthoring>
+    public class BoidObstacleAuthoring : MonoBehaviour
     {
-        public override void Bake(BoidObstacleAuthoring authoring)
+        public BoidGroups Group = BoidGroups.All;
+        public float Weight = 1f;
+        public float AvoidanceDistance = 0f;
+
+        class Baker : Baker<BoidObstacleAuthoring>
         {
-            var entity = GetEntity(TransformUsageFlags.Renderable);
-            AddComponent(entity, new BoidObstacle());
+            public override void Bake(BoidObstacleAuthoring authoring)
+            {
+                var entity = GetEntity(TransformUsageFlags.Renderable);
+                AddComponent(entity, new BoidObstacle
+                {
+                    Group = (int)authoring.Group,
+                    AvoidanceDistance = authoring.AvoidanceDistance,
+                    Weight = authoring.Weight,
+                });
+            }
         }
     }
 
+    [Serializable]
     public struct BoidObstacle : IComponentData
     {
-    }
-
-    public class BoidObstacleAuthoring : MonoBehaviour
-    {
+        public int Group;
+        public float Weight;
+        public float AvoidanceDistance;
     }
 }

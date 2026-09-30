@@ -2,9 +2,11 @@ using Unity.Collections;
 using Unity.Entities;
 using Unity.Jobs;
 using Unity.Burst;
+using UnityEngine;
 using Unity.Collections.LowLevel.Unsafe;
 using Unity.Mathematics;
 using Unity.Transforms;
+using System.Diagnostics;
 
 // Mike's GDC Talk on 'A Data Oriented Approach to Using Component Systems'
 // is a great reference for dissecting the Boids sample code:
@@ -15,6 +17,8 @@ using Unity.Transforms;
 // The targets (2 red fish) and obstacle (1 shark) move based on the ActorAnimation tab
 // in the Unity UI, so that they are moving based on key-framed animation.
 
+[assembly: RegisterGenericComponentType(typeof(Boids.BoidCollider))]
+
 namespace Boids
 {
     [RequireMatchingQueriesForUpdate]
@@ -22,9 +26,20 @@ namespace Boids
     [UpdateBefore(typeof(TransformSystemGroup))]
     public partial struct BoidSystem : ISystem
     {
+        private ComponentLookup<BoidCollider> _colliderLookup;
+        private BufferLookup<LinkedEntityGroup> _linkedGroupLookup;
+
+        [BurstCompile]
+        public void OnCreate(ref SystemState state)
+        {
+            _colliderLookup = state.GetComponentLookup<BoidCollider>(true);
+        }
+
         [BurstCompile]
         public void OnUpdate(ref SystemState state)
         {
+            _colliderLookup.Update(ref state);
+
             var boidQuery = SystemAPI.QueryBuilder().WithAll<Boid>().WithAllRW<LocalToWorld>().Build();
             var targetQuery = SystemAPI.QueryBuilder().WithAll<BoidTarget, LocalToWorld>().Build();
             var obstacleQuery = SystemAPI.QueryBuilder().WithAll<BoidObstacle, LocalToWorld>().Build();
@@ -35,6 +50,9 @@ namespace Boids
             var world = state.WorldUnmanaged;
             state.EntityManager.GetAllUniqueSharedComponents(out NativeList<Boid> uniqueBoidTypes, world.UpdateAllocator.ToAllocator);
             float dt = math.min(0.05f, SystemAPI.Time.DeltaTime);
+
+            var targetEntities = targetQuery.ToEntityArray(world.UpdateAllocator.ToAllocator);
+            var obstacleEntities = obstacleQuery.ToEntityArray(world.UpdateAllocator.ToAllocator);
 
             // Each variant of the Boid represents a different value of the SharedComponentData and is self-contained,
             // meaning Boids of the same variant only interact with one another. Thus, this loop processes each
@@ -57,17 +75,27 @@ namespace Boids
                 // note: working with a sparse grid and not a dense bounded grid so there
                 // are no predefined borders of the space.
 
-                var hashMap                   = new NativeParallelMultiHashMap<int, int>(boidCount, world.UpdateAllocator.ToAllocator);
-                var cellIndices               = CollectionHelper.CreateNativeArray<int, RewindableAllocator>(boidCount, ref world.UpdateAllocator);
-                var cellObstaclePositionIndex = CollectionHelper.CreateNativeArray<int, RewindableAllocator>(boidCount, ref world.UpdateAllocator);
-                var cellTargetPositionIndex   = CollectionHelper.CreateNativeArray<int, RewindableAllocator>(boidCount, ref world.UpdateAllocator);
-                var cellCount                 = CollectionHelper.CreateNativeArray<int, RewindableAllocator>(boidCount, ref world.UpdateAllocator);
-                var cellObstacleDistance      = CollectionHelper.CreateNativeArray<float, RewindableAllocator>(boidCount, ref world.UpdateAllocator);
-                var cellAlignment             = CollectionHelper.CreateNativeArray<float3, RewindableAllocator>(boidCount, ref world.UpdateAllocator);
-                var cellSeparation            = CollectionHelper.CreateNativeArray<float3, RewindableAllocator>(boidCount, ref world.UpdateAllocator);
+                var hashMap = new NativeParallelMultiHashMap<int, int>(boidCount, world.UpdateAllocator.ToAllocator);
+                var cellIndices = CollectionHelper.CreateNativeArray<int, RewindableAllocator>(boidCount, ref world.UpdateAllocator);
+                var cellObstaclePositions = CollectionHelper.CreateNativeArray<float3, RewindableAllocator>(boidCount, ref world.UpdateAllocator);
+                var cellTargetPositions = CollectionHelper.CreateNativeArray<float3, RewindableAllocator>(boidCount, ref world.UpdateAllocator);
+                var cellCount = CollectionHelper.CreateNativeArray<int, RewindableAllocator>(boidCount, ref world.UpdateAllocator);
+                var cellAlignment = CollectionHelper.CreateNativeArray<float3, RewindableAllocator>(boidCount, ref world.UpdateAllocator);
+                var cellSeparation = CollectionHelper.CreateNativeArray<float3, RewindableAllocator>(boidCount, ref world.UpdateAllocator);
 
-                var copyTargetPositions       = CollectionHelper.CreateNativeArray<float3, RewindableAllocator>(targetCount, ref world.UpdateAllocator);
-                var copyObstaclePositions     = CollectionHelper.CreateNativeArray<float3, RewindableAllocator>(obstacleCount, ref world.UpdateAllocator);
+                var copyTargetPositions = CollectionHelper.CreateNativeArray<float3, RewindableAllocator>(targetCount, ref world.UpdateAllocator);
+                var copyObstaclePositions = CollectionHelper.CreateNativeArray<float3, RewindableAllocator>(obstacleCount, ref world.UpdateAllocator);
+
+                var copyTargetGroups = CollectionHelper.CreateNativeArray<int, RewindableAllocator>(targetCount, ref world.UpdateAllocator);
+                var copyObstacleGroups = CollectionHelper.CreateNativeArray<int, RewindableAllocator>(obstacleCount, ref world.UpdateAllocator);
+
+                var copyTargetWeights = CollectionHelper.CreateNativeArray<float, RewindableAllocator>(targetCount, ref world.UpdateAllocator);
+                var copyObstacleWeights = CollectionHelper.CreateNativeArray<float, RewindableAllocator>(obstacleCount, ref world.UpdateAllocator);
+
+                var copyTargetAttractionDistances = CollectionHelper.CreateNativeArray<float, RewindableAllocator>(targetCount, ref world.UpdateAllocator);
+                var copyObstacleAvoidanceDistances = CollectionHelper.CreateNativeArray<float, RewindableAllocator>(obstacleCount, ref world.UpdateAllocator);
+
+
 
                 // These jobs extract the relevant position, heading component
                 // to NativeArrays so that they can be randomly accessed by the `MergeCells` and `Steer` jobs.
@@ -84,19 +112,25 @@ namespace Boids
                 var initialTargetJob = new InitialPerTargetJob
                 {
                     TargetPositions = copyTargetPositions,
+                    TargetGroups = copyTargetGroups,
+                    TargetWeights = copyTargetWeights,
+                    TargetDistances = copyTargetAttractionDistances,
                 };
                 var initialTargetJobHandle = initialTargetJob.ScheduleParallel(targetQuery, state.Dependency);
 
                 var initialObstacleJob = new InitialPerObstacleJob
                 {
                     ObstaclePositions = copyObstaclePositions,
+                    ObstacleGroups = copyObstacleGroups,
+                    ObstacleWeights = copyObstacleWeights,
+                    ObstacleAvoidanceDistances = copyObstacleAvoidanceDistances,
                 };
                 var initialObstacleJobHandle = initialObstacleJob.ScheduleParallel(obstacleQuery, state.Dependency);
 
                 var initialCellCountJob = new MemsetNativeArray<int>
                 {
                     Source = cellCount,
-                    Value  = 1
+                    Value = 1
                 };
                 var initialCellCountJobHandle = initialCellCountJob.Schedule(boidCount, 64, state.Dependency);
 
@@ -106,15 +140,24 @@ namespace Boids
 
                 var mergeCellsJob = new MergeCells
                 {
-                    cellIndices               = cellIndices,
-                    cellAlignment             = cellAlignment,
-                    cellSeparation            = cellSeparation,
-                    cellObstacleDistance      = cellObstacleDistance,
-                    cellObstaclePositionIndex = cellObstaclePositionIndex,
-                    cellTargetPositionIndex   = cellTargetPositionIndex,
-                    cellCount                 = cellCount,
-                    targetPositions           = copyTargetPositions,
-                    obstaclePositions         = copyObstaclePositions
+                    currentGroup = boidSettings.Group,
+                    cellIndices = cellIndices,
+                    cellAlignment = cellAlignment,
+                    cellSeparation = cellSeparation,
+                    cellObstaclePositions = cellObstaclePositions,
+                    cellTargetPositions = cellTargetPositions,
+                    cellCount = cellCount,
+                    targetPositions = copyTargetPositions,
+                    obstaclePositions = copyObstaclePositions,
+                    targetGroups = copyTargetGroups,
+                    obstacleGroups = copyObstacleGroups,
+                    targetWeights = copyTargetWeights,
+                    obstacleWeights = copyObstacleWeights,
+                    targetDistances = copyTargetAttractionDistances,
+                    obstacleDistances = copyObstacleAvoidanceDistances,
+                    colliderLookup = _colliderLookup,
+                    obstacleEntities = obstacleEntities,
+                    targetEntities = targetEntities,
                 };
                 var mergeCellsJobHandle = mergeCellsJob.Schedule(hashMap, 64, mergeCellsBarrierJobHandle);
 
@@ -127,9 +170,8 @@ namespace Boids
                     CellCount = cellCount,
                     CellAlignment = cellAlignment,
                     CellSeparation = cellSeparation,
-                    CellObstacleDistance = cellObstacleDistance,
-                    CellObstaclePositionIndex = cellObstaclePositionIndex,
-                    CellTargetPositionIndex = cellTargetPositionIndex,
+                    CellObstaclePositions = cellObstaclePositions,
+                    CellTargetPositions = cellTargetPositions,
                     ObstaclePositions = copyObstaclePositions,
                     TargetPositions = copyTargetPositions,
                     CurrentBoidVariant = boidSettings,
@@ -152,7 +194,7 @@ namespace Boids
             uniqueBoidTypes.Dispose();
         }
 
-                // In this sample there are 3 total unique boid variants, one for each unique value of the
+        // In this sample there are 3 total unique boid variants, one for each unique value of the
         // Boid SharedComponent (note: this includes the default uninitialized value at
         // index 0, which isnt actually used in the sample).
 
@@ -170,30 +212,58 @@ namespace Boids
         [BurstCompile]
         struct MergeCells : IJobNativeParallelMultiHashMapMergedSharedKeyIndices
         {
-            public NativeArray<int>                 cellIndices;
-            public NativeArray<float3>              cellAlignment;
-            public NativeArray<float3>              cellSeparation;
-            public NativeArray<int>                 cellObstaclePositionIndex;
-            public NativeArray<float>               cellObstacleDistance;
-            public NativeArray<int>                 cellTargetPositionIndex;
-            public NativeArray<int>                 cellCount;
-            [ReadOnly] public NativeArray<float3>   targetPositions;
-            [ReadOnly] public NativeArray<float3>   obstaclePositions;
+            public int currentGroup;
+            public NativeArray<int> cellIndices;
+            public NativeArray<float3> cellAlignment;
+            public NativeArray<float3> cellSeparation;
+            public NativeArray<float3> cellObstaclePositions;
 
-            void NearestPosition(NativeArray<float3> targets, float3 position, out int nearestPositionIndex, out float nearestDistance)
+            public NativeArray<float3> cellTargetPositions;
+
+            public NativeArray<int> cellCount;
+            [ReadOnly] public NativeArray<float3> targetPositions;
+            [ReadOnly] public NativeArray<float3> obstaclePositions;
+            [ReadOnly] public NativeArray<int> targetGroups;
+            [ReadOnly] public NativeArray<int> obstacleGroups;
+            [ReadOnly] public NativeArray<float> targetWeights;
+            [ReadOnly] public NativeArray<float> obstacleWeights;
+            [ReadOnly] public NativeArray<float> targetDistances;
+            [ReadOnly] public NativeArray<float> obstacleDistances;
+
+            [ReadOnly] public NativeArray<Entity> targetEntities;
+            [ReadOnly] public NativeArray<Entity> obstacleEntities;
+            [ReadOnly] public ComponentLookup<BoidCollider> colliderLookup;
+
+            // Alternative to nearest, get weighted average of targets with weights based on difference
+            void AveragePosition(NativeArray<float3> targets, NativeArray<float> weights, NativeArray<float> distances, NativeArray<Entity> entities, NativeArray<int> groups, float3 position, int currentGroup, out float3 averagePosition)
             {
-                nearestPositionIndex = 0;
-                nearestDistance      = math.lengthsq(position - targets[0]);
-                for (int i = 1; i < targets.Length; i++)
-                {
-                    var targetPosition = targets[i];
-                    var distance       = math.lengthsq(position - targetPosition);
-                    var nearest        = distance < nearestDistance;
+                averagePosition = float3.zero;
+                float totalWeight = 0f;
 
-                    nearestDistance      = math.select(nearestDistance, distance, nearest);
-                    nearestPositionIndex = math.select(nearestPositionIndex, i, nearest);
+                for (int i = 0; i < targets.Length; i++)
+                {
+                    if ((groups[i] & currentGroup) == 0)
+                        continue;
+
+                    // Default target position
+                    var targetPosition = targets[i];
+
+
+                    if (colliderLookup.HasComponent(entities[i]))
+                    {
+                        BoidCollider collider = colliderLookup[entities[i]];
+                        targetPosition = BoidColliderUtility.SampleNearestPoint(collider, in position);
+                    }
+
+                    // Actual distance minus target distance
+                    var distance = math.max(math.square(math.length(position - targetPosition) - distances[i]), 1e-3f); // Avoid div by zero
+                    var weight = weights[i] / distance;
+
+                    totalWeight += weight;
+                    averagePosition += targetPosition * weight;
                 }
-                nearestDistance = math.sqrt(nearestDistance);
+
+                averagePosition = totalWeight > 0 ? averagePosition / totalWeight : 0f;
             }
 
             // Resolves the distance of the nearest obstacle and target and stores the cell index.
@@ -201,16 +271,13 @@ namespace Boids
             {
                 var position = cellSeparation[index] / cellCount[index];
 
-                int obstaclePositionIndex;
-                float obstacleDistance;
-                NearestPosition(obstaclePositions, position, out obstaclePositionIndex, out obstacleDistance);
-                cellObstaclePositionIndex[index] = obstaclePositionIndex;
-                cellObstacleDistance[index]      = obstacleDistance;
+                float3 obstaclePosition;
+                AveragePosition(obstaclePositions, obstacleWeights, obstacleDistances, obstacleEntities, obstacleGroups, position, currentGroup, out obstaclePosition);
+                cellObstaclePositions[index] = obstaclePosition;
 
-                int targetPositionIndex;
-                float targetDistance;
-                NearestPosition(targetPositions, position, out targetPositionIndex, out targetDistance);
-                cellTargetPositionIndex[index] = targetPositionIndex;
+                float3 targetPosition;
+                AveragePosition(targetPositions, targetWeights, targetDistances, targetEntities, targetGroups, position, currentGroup, out targetPosition);
+                cellTargetPositions[index] = targetPosition;
 
                 cellIndices[index] = index;
             }
@@ -220,10 +287,10 @@ namespace Boids
             // note: these items are summed so that in `Steer` their average for the cell can be resolved.
             public void ExecuteNext(int cellIndex, int index)
             {
-                cellCount[cellIndex]      += 1;
-                cellAlignment[cellIndex]  += cellAlignment[cellIndex];
+                cellCount[cellIndex] += 1;
+                cellAlignment[cellIndex] += cellAlignment[cellIndex];
                 cellSeparation[cellIndex] += cellSeparation[cellIndex];
-                cellIndices[index]        = cellIndex;
+                cellIndices[index] = cellIndex;
             }
         }
 
@@ -253,9 +320,15 @@ namespace Boids
         partial struct InitialPerTargetJob : IJobEntity
         {
             public NativeArray<float3> TargetPositions;
-            void Execute([EntityIndexInQuery] int entityIndexInQuery, in LocalToWorld localToWorld)
+            public NativeArray<int> TargetGroups;
+            public NativeArray<float> TargetWeights;
+            public NativeArray<float> TargetDistances;
+            void Execute([EntityIndexInQuery] int entityIndexInQuery, in BoidTarget boidTarget, in LocalToWorld localToWorld)
             {
                 TargetPositions[entityIndexInQuery] = localToWorld.Position;
+                TargetGroups[entityIndexInQuery] = boidTarget.Group;
+                TargetWeights[entityIndexInQuery] = boidTarget.Weight;
+                TargetDistances[entityIndexInQuery] = boidTarget.TargetDistance;
             }
         }
 
@@ -263,9 +336,15 @@ namespace Boids
         partial struct InitialPerObstacleJob : IJobEntity
         {
             public NativeArray<float3> ObstaclePositions;
-            void Execute([EntityIndexInQuery] int entityIndexInQuery, in LocalToWorld localToWorld)
+            public NativeArray<int> ObstacleGroups;
+            public NativeArray<float> ObstacleWeights;
+            public NativeArray<float> ObstacleAvoidanceDistances;
+            void Execute([EntityIndexInQuery] int entityIndexInQuery, in BoidObstacle boidObstacle, in LocalToWorld localToWorld)
             {
                 ObstaclePositions[entityIndexInQuery] = localToWorld.Position;
+                ObstacleGroups[entityIndexInQuery] = boidObstacle.Group;
+                ObstacleWeights[entityIndexInQuery] = boidObstacle.Weight;
+                ObstacleAvoidanceDistances[entityIndexInQuery] = boidObstacle.AvoidanceDistance;
             }
         }
 
@@ -276,9 +355,8 @@ namespace Boids
             [ReadOnly] public NativeArray<int> CellCount;
             [ReadOnly] public NativeArray<float3> CellAlignment;
             [ReadOnly] public NativeArray<float3> CellSeparation;
-            [ReadOnly] public NativeArray<float> CellObstacleDistance;
-            [ReadOnly] public NativeArray<int> CellObstaclePositionIndex;
-            [ReadOnly] public NativeArray<int> CellTargetPositionIndex;
+            [ReadOnly] public NativeArray<float3> CellObstaclePositions;
+            [ReadOnly] public NativeArray<float3> CellTargetPositions;
             [ReadOnly] public NativeArray<float3> ObstaclePositions;
             [ReadOnly] public NativeArray<float3> TargetPositions;
             public Boid CurrentBoidVariant;
@@ -287,64 +365,78 @@ namespace Boids
             void Execute([EntityIndexInQuery] int entityIndexInQuery, ref LocalToWorld localToWorld)
             {
                 // temporarily storing the values for code readability
-                var forward                           = localToWorld.Forward;
-                var currentPosition                   = localToWorld.Position;
-                var cellIndex                         = CellIndices[entityIndexInQuery];
-                var neighborCount                     = CellCount[cellIndex];
-                var alignment                         = CellAlignment[cellIndex];
-                var separation                        = CellSeparation[cellIndex];
-                var nearestObstacleDistance           = CellObstacleDistance[cellIndex];
-                var nearestObstaclePositionIndex      = CellObstaclePositionIndex[cellIndex];
-                var nearestTargetPositionIndex        = CellTargetPositionIndex[cellIndex];
-                var nearestObstaclePosition           = ObstaclePositions[nearestObstaclePositionIndex];
-                var nearestTargetPosition             = TargetPositions[nearestTargetPositionIndex];
+                var forward = localToWorld.Forward;
+                var currentPosition = localToWorld.Position;
+                var cellIndex = CellIndices[entityIndexInQuery];
+                var neighborCount = CellCount[cellIndex];
+                var alignment = CellAlignment[cellIndex];
+                var separation = CellSeparation[cellIndex];
+                var obstaclePosition = CellObstaclePositions[cellIndex];
+                var targetPosition = CellTargetPositions[cellIndex];
 
                 // Setting up the directions for the three main biocrowds influencing directions adjusted based
                 // on the predefined weights:
                 // 1) alignment - how much should it move in a direction similar to those around it?
                 // note: we use `alignment/neighborCount`, because we need the average alignment in this case; however
                 // alignment is currently the summation of all those of the boids within the cellIndex being considered.
-                var alignmentResult     = CurrentBoidVariant.AlignmentWeight
+                var alignmentResult = CurrentBoidVariant.AlignmentWeight
                                           * math.normalizesafe((alignment / neighborCount) - forward);
                 // 2) separation - how close is it to other boids and are there too many or too few for comfort?
                 // note: here separation represents the summed possible center of the cell. We perform the multiplication
                 // so that both `currentPosition` and `separation` are weighted to represent the cell as a whole and not
                 // the current individual boid.
-                var separationResult    = CurrentBoidVariant.SeparationWeight
+                var separationResult = CurrentBoidVariant.SeparationWeight
                                           * math.normalizesafe((currentPosition * neighborCount) - separation);
-                // 3) target - is it still towards its destination?
-                var targetHeading       = CurrentBoidVariant.TargetWeight
-                                          * math.normalizesafe(nearestTargetPosition - currentPosition);
 
-                // creating the obstacle avoidant vector s.t. it's pointing towards the nearest obstacle
-                // but at the specified 'ObstacleAversionDistance'. If this distance is greater than the
-                // current distance to the obstacle, the direction becomes inverted. This simulates the
-                // idea that if `currentPosition` is too close to an obstacle, the weight of this pushes
-                // the current boid to escape in the fastest direction; however, if the obstacle isn't
-                // too close, the weighting denotes that the boid doesnt need to escape but will move
-                // slower if still moving in that direction (note: we end up not using this move-slower
-                // case, because of `targetForward`'s decision to not use obstacle avoidance if an obstacle
-                // isn't close enough).
-                var obstacleSteering                  = currentPosition - nearestObstaclePosition;
-                var avoidObstacleHeading              = (nearestObstaclePosition + math.normalizesafe(obstacleSteering)
-                    * CurrentBoidVariant.ObstacleAversionDistance) - currentPosition;
+                // 3) Unity devs forgot about cohesion! Let's calculate that as well -- very similar to separationResult
+                var cohesionResult = CurrentBoidVariant.CohesionWeight
+                                            * math.normalizesafe((separation / neighborCount) - currentPosition);
 
-                // the updated heading direction. If not needing to be avoidant (ie obstacle is not within
-                // predefined radius) then go with the usual defined heading that uses the amalgamation of
-                // the weighted alignment, separation, and target direction vectors.
-                var nearestObstacleDistanceFromRadius = nearestObstacleDistance - CurrentBoidVariant.ObstacleAversionDistance;
-                var normalHeading                     = math.normalizesafe(alignmentResult + separationResult + targetHeading);
-                var targetForward                     = math.select(normalHeading, avoidObstacleHeading, nearestObstacleDistanceFromRadius < 0);
+                // 4) target - is it still towards its destination?
+                var targetResult = TargetPositions.Length > 0 ? CurrentBoidVariant.TargetWeight
+                                          * math.normalizesafe(targetPosition - currentPosition)
+                                          : float3.zero;    // Zero if no targets
 
-                // updates using the newly calculated heading direction
-                var nextHeading                       = math.normalizesafe(forward + DeltaTime * (targetForward - forward));
+                // 5) obstacles - "weight" has to be different here. In order to ensure the boid never
+                // reaches the obstacle, the weight is the exposed weight times inverse of the distance to
+                // the specified threshold.
+                //
+                // The original logic calculated an avoidance vector that was
+                // towards the obstacle, but within the specified range, inverted when the entity is
+                // too close to the obstacle.
+                // var obstacleAvoidanceDirection = (obstaclePosition + math.normalizesafe(currentPosition - obstaclePosition))
+                //                                 * CurrentBoidVariant.ObstacleAversionDistance
+                //                                 - currentPosition;
+
+                // In this version, we follow the more standard setup and
+                // choose the vector away from the obstacle as the direction
+                var obstacleAvoidanceDirection = currentPosition - obstaclePosition;
+
+                var obstacleResult = ObstaclePositions.Length > 0 ? math.square(CurrentBoidVariant.ObstacleWeight)
+                                            * (1 / (
+                                                math.max(                                           // Avoid div by 0 or negative
+                                                    math.length(currentPosition - obstaclePosition)
+                                                    - CurrentBoidVariant.ObstacleAversionDistance,  // Distance from aversion threshold
+                                                    1e-3f
+                                                )
+                                            ))
+                                            * math.normalizesafe(obstacleAvoidanceDirection)  // Vector away from obstacle
+                                            : float3.zero;  // Zero if no obstacles
+
+                // Combine all vectors to one forward vector, normalize to find direction
+                var targetForward = math.normalizesafe(alignmentResult + separationResult + cohesionResult + targetResult + obstacleResult);
+
+                // Updates using the newly calculated heading direction -- must allow entities to
+                // change direction as fast as is necessary to avoid obstacles
+                var nextHeading = math.normalizesafe(forward + DeltaTime * math.clamp(math.length(obstacleResult), 1f, 1f / DeltaTime) * (targetForward - forward));
                 localToWorld = new LocalToWorld
                 {
                     Value = float4x4.TRS(
                         // TODO: precalc speed*dt
                         new float3(localToWorld.Position + (nextHeading * MoveDistance)),
                         quaternion.LookRotationSafe(nextHeading, math.up()),
-                        new float3(1.0f, 1.0f, 1.0f))
+                        CurrentBoidVariant.Scale
+                    )
                 };
             }
         }
